@@ -1,11 +1,13 @@
+import bz2
 import time
 import tarfile
 import uuid
 import zlib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from multiprocessing import Pool
 from os import SEEK_END
-from typing import BinaryIO
+from typing import BinaryIO, Iterable, Self
 
 KNOWN_NAMES: dict[bytes, str] = {
     # "Name"
@@ -59,7 +61,6 @@ KNOWN_NAMES: dict[bytes, str] = {
     # "EnabledGameModes"
     # b'\00\ff\00\ff': "GameChallengeUuid"
 
-
     # Mod object entries
     b'\x54\x5f\xc4\x04': "Id",
     b'\x72\xe1\x34\x30': "Name",
@@ -73,7 +74,9 @@ KNOWN_NAMES: dict[bytes, str] = {
 
 
 def _parse_int32(input_buffer: BinaryIO) -> int:
-    return int.from_bytes(input_buffer.read(4), byteorder="little", signed=False)
+    return int.from_bytes(input_buffer.read(4),
+                          byteorder="little",
+                          signed=False)
 
 
 def _to_bytes(x: int) -> bytes:
@@ -86,7 +89,7 @@ class Marker:
     type_: int
 
     def serialize(self) -> bytes:
-        return name + _to_bytes(self.type_)
+        return self.name + _to_bytes(self.type_)
 
     def pretty_str(self) -> str:
         return f"[[{KNOWN_NAMES.get(self.name, f'{self.name}')}, {hex(self.type_)}]]"
@@ -106,6 +109,20 @@ class GameElement(ABC):
         """Uncompressed content, to be stored in final gzip"""
         ...
 
+    @staticmethod
+    def merge(copies: list[Self]) -> bytes:
+        """Uncompressed content of N instances of an element, concatenated"""
+        marker = copies[0].marker
+        # print("Merging", marker.pretty_str())
+        assert all(elem.marker == marker for elem in copies)
+        if all(elem == copies[0] for elem in copies):
+            # print("All identical")
+            return marker.serialize(
+            ) + b'0' + copies[0].serialize_uncompressed()[4:]
+        # print("Differences are there")
+        return marker.serialize() + b'\x01' + b''.join(
+            elem.serialize_uncompressed()[4:] for elem in copies)
+
     @abstractmethod
     def pretty_str(self) -> str:
         """Debug str that's ~= 80 char long"""
@@ -118,7 +135,7 @@ class IntElement(GameElement):
     value: int
 
     def serialize(self) -> bytes:
-        return self.header.serialize() + (b'\0' * 8) + _to_bytes(self.value)
+        return self.marker.serialize() + (b'\0' * 8) + _to_bytes(self.value)
 
     def serialize_uncompressed(self) -> bytes:
         return self.serialize()
@@ -133,11 +150,9 @@ class ByteData:
     b_per_element: int
 
     def serialize(self) -> bytes:
-        return ((len(b) // b_per_element).to_bytes(3, "little", signed=False) +
-                b"\x21" + _to_bytes(self.b_per_element) + self.b)
-
-    def pretty_str(self) -> str:
-        return
+        return ((len(self.b) // self.b_per_element).to_bytes(
+            3, "little", signed=False) + b"\x21" +
+                _to_bytes(self.b_per_element) + self.b)
 
 
 @dataclass(kw_only=True)
@@ -204,19 +219,21 @@ class Unknown16Bytes(GameElement):
     def pretty_str(self) -> str:
         return f"16Bytes( {self.marker.pretty_str()}, {self.content} (or {uuid.UUID(bytes=self.content)}) )"
 
+
 @dataclass(kw_only=True)
 class TimestampElement(GameElement):
     """16 byte element, bytes 9-12 are an epoch timestamp."""
     epoch: int
 
     def serialize(self) -> bytes:
-        return self.marker.serialize + (b'\0' * 8) + _to_bytes(self.epoch) + (b'\0' * 4)
+        return (self.marker.serialize() + (b'\0' * 8) + _to_bytes(self.epoch) +
+                (b'\0' * 4))
 
     def serialize_uncompressed(self) -> bytes:
         return self.serialize()
 
     def pretty_str(self) -> str:
-        return f"Timestamp( {self.marker.pretty_str()}, {time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(self.epoch))} )"
+        return f"Timestamp( {self.marker.pretty_str()}, {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(self.epoch))} )"
 
 
 @dataclass(kw_only=True)
@@ -225,13 +242,28 @@ class Unknown12Bytes(GameElement):
     content: bytes
 
     def serialize(self) -> bytes:
-        return self.marker.serialize + content
+        return self.marker.serialize() + self.content
 
     def serialize_uncompressed(self) -> bytes:
         return self.serialize()
 
     def pretty_str(self) -> str:
-        return f"16Bytes( {self.marker.pretty_str()}, {self.content} )"
+        return f"12Bytes( {self.marker.pretty_str()}, {self.content} )"
+
+
+@dataclass(kw_only=True)
+class Unknown8Bytes(GameElement):
+    """Unknown, 8 bytes, with \0\0\0\x80\0\0\0\0 header"""
+    content: bytes
+
+    def serialize(self) -> bytes:
+        return self.marker.serialize() + b'\0\0\0\x80\0\0\0\0' + self.content
+
+    def serialize_uncompressed(self) -> bytes:
+        return self.serialize()
+
+    def pretty_str(self) -> str:
+        return f"12BytesWHeader( {self.marker.pretty_str()}, {self.content} )"
 
 
 @dataclass(kw_only=True)
@@ -240,8 +272,7 @@ class BooleanElement(GameElement):
     value: int
 
     def serialize(self) -> bytes:
-        return (self.marker.serialize + (b'\0' * 8) +
-                _to_bytes(self.value))
+        return (self.marker.serialize() + (b'\0' * 8) + _to_bytes(self.value))
 
     def serialize_uncompressed(self) -> bytes:
         return self.serialize()
@@ -274,12 +305,11 @@ class CompressedElement(GameElement):
 
     def serialize(self) -> bytes:
         final_len = len(self.header) + sum(len(chunk) + 4 for chunk in chunks)
-        return (self.marker.serialize() +
-                ByteData(b=self.header + self.inflated_size.to_bytes(
-                    4, "little", signed=False) + b''.join(
-                        _to_bytes(len(chunk)) + chunk
-                        for chunk in chunks),
-                         b_per_element=1).serialize())
+        return (self.marker.serialize() + ByteData(
+            b=self.header +
+            self.inflated_size.to_bytes(4, "little", signed=False) +
+            b''.join(_to_bytes(len(chunk)) + chunk for chunk in chunks),
+            b_per_element=1).serialize())
 
     def serialize_uncompressed(self) -> bytes:
         return self.marker.serialize() + ByteData(
@@ -298,9 +328,13 @@ class Array0AElement(GameElement):
     elements: list[GameElement]
 
     def serialize(self) -> bytes:
-        return b'\0\0\0\x05\0\0\0\0' + len(elements).to_bytes(
-            4, "little", signed=False) + b''.join(element.serialize()
-                                                  for element in self.elements)
+        try:
+            return b'\0\0\0\x05\0\0\0\0' + len(self.elements).to_bytes(
+                4, "little", signed=False) + b''.join(
+                    element.serialize() for element in self.elements)
+        except AttributeError as ex:
+            print([i for i, el in enumerate(self.elements) if el is None])
+            raise ex
 
     def serialize_uncompressed(self) -> bytes:
         # TODO: inflate each subelement
@@ -323,7 +357,7 @@ class Array0BElement(GameElement):
     def serialize(self) -> bytes:
         # Make sure to cut off the name of the marker for every element.
         # Hint - this script sets the names to "\0\0\0\0" anyway.
-        return self.marker.serialize() + header + b''.join(
+        return self.marker.serialize() + self.header + b''.join(
             entry.serialize()[4:] for entry in self.content)
 
     def serialize_uncompressed(self) -> bytes:
@@ -337,8 +371,9 @@ class Array0BElement(GameElement):
                  f"\n(etc... {len(self.content)} in total.)"))
 
 
-
-def _parse_marker(input_buffer: BinaryIO, *, name: bytes | None = None) -> Marker | None:
+def _parse_marker(input_buffer: BinaryIO,
+                  *,
+                  name: bytes | None = None) -> Marker | None:
     name = name or input_buffer.read(4)
     if len(name) == 0:
         return None
@@ -354,9 +389,12 @@ def _read_byte_data(input_buffer: BinaryIO) -> ByteData | bytes:
                         b_per_element=b_per_element)
     elif l == 0:
         b_per_element_bytes = input_buffer.read(4)
-        if (supposed_zeroes:=input_buffer.read(4)) != b'\0'*4:
-            RuntimeError(f"Unrecognized string content at {hex(input_buffer.tell()-12)}: {l.to_bytes(2,"little",signed=False) + header + b_per_element_bytes + supposed_zeroes}")
-        return l.to_bytes(3, "little", signed=False) + header + b_per_element_bytes 
+        if (supposed_zeroes := input_buffer.read(4)) != b'\0' * 4:
+            RuntimeError(
+                f"Unrecognized string content at {hex(input_buffer.tell()-12)}: {l.to_bytes(2,'little',signed=False) + header + b_per_element_bytes + supposed_zeroes}"
+            )
+        return l.to_bytes(3, "little",
+                          signed=False) + header + b_per_element_bytes
     else:
         raise RuntimeError(
             f"Unexpected string header at {hex(input_buffer.tell())}: {header}"
@@ -368,22 +406,27 @@ def parse_element(marker: Marker,
     match marker:
         case Marker(type_=0x1):
 
-            if (_buf:=input_buffer.read(8)) != b'\0' * 8:
-                print(f"At {hex(input_buffer.tell() - 8)}: Unrecognized bool flags: {_buf}")
+            if (_buf := input_buffer.read(8)) != b'\0' * 8:
+                print(
+                    f"At {hex(input_buffer.tell() - 8)}: Unrecognized bool flags: {_buf}"
+                )
                 return None
             value = _parse_int32(input_buffer)
             if value > 1:
-                print(f"At {hex(input_buffer.tell() - 4)}: Unexpected bool value = {value}")
+                print(
+                    f"At {hex(input_buffer.tell() - 4)}: Unexpected bool value = {value}"
+                )
                 return None
             assert value <= 1
             return BooleanElement(marker=marker, value=value)
 
         case Marker(type_=0x2):
-            if (_buf:=input_buffer.read(8)) != b'\0' * 8:
-                print(f"At {hex(input_buffer.tell() - 8)}: Unrecognized int flags: {_buf}")
+            if (_buf := input_buffer.read(8)) != b'\0' * 8:
+                print(
+                    f"At {hex(input_buffer.tell() - 8)}: Unrecognized int flags: {_buf}"
+                )
                 return None
-            return IntElement(marker=marker,
-                              value=_parse_int32(input_buffer))
+            return IntElement(marker=marker, value=_parse_int32(input_buffer))
         case Marker(type_=0x3):
             return Unknown12Bytes(marker=marker, content=input_buffer.read(12))
 
@@ -407,6 +450,11 @@ def parse_element(marker: Marker,
             for _ in range(element_count):
                 element_marker = _parse_marker(input_buffer)
                 element = parse_element(element_marker, input_buffer)
+                if element is None:
+                    print(
+                        f"At {hex(input_buffer.tell())}: Couldn't parse elem of 0xA array"
+                    )
+                    exit(1)
                 elements.append(element)
             return Array0AElement(marker=marker, elements=elements)
 
@@ -426,12 +474,17 @@ def parse_element(marker: Marker,
         case Marker(type_=0xD):
             return Unknown16Bytes(marker=marker, content=input_buffer.read(16))
 
-        case Marker(type_=0x14): 
+        case Marker(type_=0x14):
             assert input_buffer.read(8) == b'\0\0\0\x80\0\0\0\0'
             timestamp = _parse_int32(input_buffer)
             assert input_buffer.read(4) == b'\0\0\0\0'
             return TimestampElement(marker=marker, epoch=timestamp)
- 
+
+        case Marker(type_=0x15):
+            assert input_buffer.read(8) == b'\0\0\0\x80\0\0\0\0'
+            content = input_buffer.read(8)
+            return Unknown8Bytes(marker=marker, content=content)
+
         case Marker(type_=0x18):
             byte_data = _read_byte_data(input_buffer)
             with open('debug.bin', 'wb') as debug_file:
@@ -472,6 +525,10 @@ class FileSection(ABC):
     def serialize_uncompressed(self) -> bytes:
         ...
 
+    @classmethod
+    def merge(cls, sections: list[Self]) -> bytes:
+        ...
+
 
 @dataclass(kw_only=True)
 class RegularFileSection(FileSection):
@@ -482,19 +539,41 @@ class RegularFileSection(FileSection):
     def serialize(self) -> bytes:
         reported_size = len(self.elements)
         if self.type_ == 1 and reported_size >= 0x40:
-            reported_size -= 4 # dunno why
-        return (_to_bytes(self.type_) +
-                _to_bytes(reported_size) +
+            reported_size -= 4  # dunno why
+        return (_to_bytes(self.type_) + _to_bytes(reported_size) +
                 b''.join(element.serialize() for element in self.elements))
 
     def serialize_uncompressed(self) -> bytes:
         return self.serialize()
 
+    @classmethod
+    def merge(cls, sections: list[Self]) -> bytes:
+        print(f"Merging {len(sections)} regular sections...")
+        f = sections[0]
+        assert all(section.type_ == f.type_ for section in sections)
+        assert all(
+            len(section.elements) == len(f.elements) for section in sections)
+        if all(section == f for section in sections[1:]):
+            print("All sections equal, writing one copy")
+            return (_to_bytes(f.type_) + b'0' + _to_bytes(len(f.elements)) +
+                    b''.join(elem.serialize_uncompressed()
+                             for elem in f.elements))
+        return (_to_bytes(sections[0].type_) + b'\x01' +
+                _to_bytes(len(f.elements)) + b''.join(
+                    GameElement.merge(elems)
+                    for elems in zip(*(section.elements
+                                       for section in sections))))
+
 
 @dataclass
 class NamelessSection(RegularFileSection):
+
     def serialize(self) -> bytes:
         return super().serialize()[4:]
+
+    @classmethod
+    def merge(cls, sections: list[Self]) -> bytes:
+        return super().merge(sections)[4:]
 
 
 @dataclass(kw_only=True)
@@ -507,6 +586,10 @@ class EmptyFileSection(FileSection):
     def serialize_uncompressed(self) -> bytes:
         return b'\x10\0\0\0'
 
+    @classmethod
+    def merge(cls, sections: list[Self]) -> bytes:
+        return b'\x10\0\0\0'
+
 
 @dataclass(kw_only=True)
 class MultiSection(FileSection):
@@ -514,16 +597,31 @@ class MultiSection(FileSection):
     subsections: list[tuple[int, list[GameElement]]]
 
     def serialize(self) -> bytes:
-        return (_to_bytes(len(self.elements)) +
-                b''.join(
-                    _to_bytes(index)
-                    + _to_bytes(len(l))
-                    + b''.join(elem.serialize() for elem in l)
-                    for index, l in self.subsections
-                    ))
+        return (_to_bytes(len(self.elements)) + b''.join(
+            _to_bytes(index) + _to_bytes(len(l)) + b''.join(elem.serialize()
+                                                            for elem in l)
+            for index, l in self.subsections))
 
     def serialize_uncompressed(self) -> bytes:
         return self.serialize()
+
+    @classmethod
+    def merge(cls, sections: list[Self]) -> bytes:
+        f = sections[0]
+        subsection_cnt = lambda x: sum(len(ss) for _, ss in x.subsections)
+        subsection_ids = lambda x: [i for i, _ in x.subsections]
+        assert all(
+            subsection_cnt(section) == subsection_cnt(f)
+            for section in sections)
+        assert all(
+            subsection_ids(section) == subsection_ids(f)
+            for section in sections)
+        return (_to_bytes(len(f.subsections)) + b''.join(
+            _to_bytes(i) + NamelessSection.merge([
+                NamelessSection(type_=0xffffffff,
+                                elements=section.subsections[i][1])
+                for section in sections
+            ]) for i in range(len(f.subsections))))
 
 
 def parse_n_elements(input_buffer: BinaryIO, n: int) -> list[GameElement]:
@@ -538,19 +636,24 @@ def parse_n_elements(input_buffer: BinaryIO, n: int) -> list[GameElement]:
     return elements
 
 
-_MAX_DEFLATED_CHUNK_SIZE = 0x1000000
-
-
 @dataclass(kw_only=True)
 class CompressedSection(FileSection):
     deflated_content: list[bytes]
 
     def serialize(self) -> bytes:
-        b''.join(_to_bytes(len(content)) + content for content in self.deflated_content)
+        b''.join(
+            _to_bytes(len(content)) + content
+            for content in self.deflated_content)
 
     def serialize_uncompressed(self) -> bytes:
-        i = zlib.decompress(b''.join(self.deflated_content))
-        return [i[j:j+_MAX_DEFLATED_CHUNK_SIZE] for j in range(0, len(i), _MAX_DEFLATED_CHUNK_SIZE)]
+        i = zlib.decompressobj().decompress(b''.join(self.deflated_content))
+        print(len(i))
+        return len(i).to_bytes(4, "little", signed=False) + i
+
+    @classmethod
+    def merge(cls, sections: list[Self]) -> bytes:
+        return b''.join(section.serialize_uncompressed()
+                        for section in sections)
 
 
 @dataclass(kw_only=True)
@@ -561,10 +664,10 @@ class BitmapSection(FileSection):
     bmap: list[int]
 
     def serialize(self) -> bytes:
-        return (_to_bytes(self.type_)
-         + size[0].to_bytes(4, "little", signed=False)
-         + size[1].to_bytes(4, "little", signed=False)
-         + b''.join(_to_bytes(x) for x in self.bmap))
+        return (_to_bytes(self.type_) +
+                size[0].to_bytes(4, "little", signed=False) +
+                size[1].to_bytes(4, "little", signed=False) +
+                b''.join(_to_bytes(x) for x in self.bmap))
 
     def serialize_uncompressed(self) -> bytes:
         return self.serialize()
@@ -576,9 +679,8 @@ class PairsSection(FileSection):
     entries: list[bytes]
 
     def serialize(self) -> bytes:
-        return (b'\xa5\xa5\0\0'
-                + _to_bytes(len(self.entries))
-                + b''.join(entries))
+        return (b'\xa5\xa5\0\0' + _to_bytes(len(self.entries)) +
+                b''.join(entries))
 
 
 @dataclass(kw_only=True)
@@ -592,10 +694,9 @@ class AlmostConstantSection(FileSection):
     flagged_ints: list[bytes]
 
     def serialize(self) -> bytes:
-        return (_to_bytes(len(self.bytes_)) + self.bytes_
-                + _to_bytes(len(self.flagged_ints))
-                + b''.join(self.flagged_ints)
-                + 3 * (b'\x01\0\0\0'))
+        return (_to_bytes(len(self.bytes_)) + self.bytes_ +
+                _to_bytes(len(self.flagged_ints)) +
+                b''.join(self.flagged_ints) + 3 * (b'\x01\0\0\0'))
 
     def serialize_uncompressed(self) -> bytes:
         return self.serialize()
@@ -612,76 +713,80 @@ class CustomDataSection(FileSection):
     elements: list[GameElement]
 
     def serialize(self) -> bytes:
-        return (_to_bytes(len(self.label)) + label
-                + _to_bytes(len(self.elements))
-                + b''.join(e.serialize() for e in self.elements))
+        return (_to_bytes(len(self.label)) + label +
+                _to_bytes(len(self.elements)) +
+                b''.join(e.serialize() for e in self.elements))
 
 
 def parse_regular_section(input_buffer: BinaryIO) -> FileSection:
-    print(f"At {hex(input_buffer.tell())} ## NEW FILE SECTION")
+    # print(f"At {hex(input_buffer.tell())} ## NEW FILE SECTION")
     type_ = input_buffer.read(4)
-    print(f"Section type: {type_}")
+    # print(f"Section type: {type_}")
     if type_ == b'\x10\0\0\0':
         return EmptyFileSection()
 
     count = _parse_int32(input_buffer)
-    count = count + 4 if (type_[0] == 1 and count > 0x40) else count
-    print(f"Expected number of elements: {count}")
-    return RegularFileSection(type_=int(type_[0]), elements=parse_n_elements(input_buffer, count))
+    # count = count + 4 if (type_[0] == 1 and count > 0x40) else count
+    # print(f"Expected number of elements: {count}")
+    return RegularFileSection(type_=int(type_[0]),
+                              elements=parse_n_elements(input_buffer, count))
 
 
 def parse_nameless_section(input_buffer: BinaryIO) -> NamelessSection:
-    print(f"At {hex(input_buffer.tell())} ## NEW NAMELESS SECTION")
+    # print(f"At {hex(input_buffer.tell())} ## NEW NAMELESS SECTION")
     count = _parse_int32(input_buffer)
-    count = count + 4 if count > 0x40 else count
-    print(f"Expected number of elements: {count}")
-    return NamelessSection(type_=-1, elements=parse_n_elements(input_buffer, count))
+    # count = count + 4 if count > 0x40 else count
+    # print(f"Expected number of elements: {count}")
+    return NamelessSection(type_=0xffffffff,
+                           elements=parse_n_elements(input_buffer, count))
 
 
 def parse_multisection(input_buffer: BinaryIO) -> MultiSection:
-    print(f"At {hex(input_buffer.tell())} ## NEW MULTISECTION")
+    # print(f"At {hex(input_buffer.tell())} ## NEW MULTISECTION")
     count = _parse_int32(input_buffer)
-    print(f"subsection cnt: {count}")
+    # print(f"subsection cnt: {count}")
     res: list[tuple[int, list[GameElement]]] = []
     for _ in range(count):
         idx = _parse_int32(input_buffer)
         subcount = _parse_int32(input_buffer)
-        print(f"# SUBSECTION idx={idx}, expected {subcount} elements")
+        # print(f"# SUBSECTION idx={idx}, expected {subcount} elements")
         res.append((idx, parse_n_elements(input_buffer, subcount)))
     return MultiSection(subsections=res)
 
 
 def parse_compressed(input_buffer: BinaryIO) -> CompressedSection:
-    print(f"At {hex(input_buffer.tell())} ## NEW COMPRESSED SECTION")
+    # print(f"At {hex(input_buffer.tell())} ## NEW COMPRESSED SECTION")
     data: list[bytes] = []
     while True:
         chunk_size = _parse_int32(input_buffer)
         # print(f"CHUNK at {hex(input_buffer.tell())} size={chunk_size}")
         data.append(input_buffer.read(chunk_size))
         if chunk_size < 0x10000:
-            print(f"Read {len(data)} chunks for a total of {hex(sum(len(d) for d in data))} bytes")
+            print(
+                f"Read {len(data)} chunks for a total of {hex(sum(len(d) for d in data))} bytes"
+            )
             return CompressedSection(deflated_content=data)
 
 
 def parse_bmap(input_buffer: BinaryIO) -> BitmapSection:
-    print(f"At {hex(input_buffer.tell())} ## NEW BITMAP SECTION")
+    # print(f"At {hex(input_buffer.tell())} ## NEW BITMAP SECTION")
     type_ = _parse_int32(input_buffer)
-    size = (_parse_int32(input_buffer),
-            _parse_int32(input_buffer))
-    print(f"Section type={type_}, size={size}, expected {hex(size[0]*size[1]*4)} bytes")
+    size = (_parse_int32(input_buffer), _parse_int32(input_buffer))
+    # print(
+    #     f"Section type={type_}, size={size}, expected {hex(size[0]*size[1]*4)} bytes"
+    # )
 
     data: list[int] = [
-            _parse_int32(input_buffer)
-            for _ in range(size[0] * size[1])
+        _parse_int32(input_buffer) for _ in range(size[0] * size[1])
     ]
     return BitmapSection(type_=type_, size=size, bmap=data)
 
 
 def parse_pairs_section(input_buffer: BinaryIO) -> PairsSection:
-    print(f"At {hex(input_buffer.tell())} ## NEW PAIRS SECTION")
+    # print(f"At {hex(input_buffer.tell())} ## NEW PAIRS SECTION")
     assert input_buffer.read(4) == b'\xa5\xa5\0\0'
     count = _parse_int32(input_buffer)
-    print(f"No pairs: {count}")
+    # print(f"No pairs: {count}")
     return PairsSection(entries=[input_buffer.read(10) for _ in range(count)])
 
 
@@ -689,14 +794,14 @@ def parse_jack_shit(input_buffer: BinaryIO) -> list[GameElement | bytes]:
     assert input_buffer.read(4) == b'CIV6'
     result: list[GameElement | bytes] = []
     elements_since = 0
-    while (tag_bytes:=input_buffer.read(4)) is not None:
+    while (tag_bytes := input_buffer.read(4)) is not None:
         skip_target_pos = input_buffer.tell()
         marker = _parse_marker(input_buffer, name=tag_bytes)
-        if (element:=parse_element(marker, input_buffer)) is None:
+        if (element := parse_element(marker, input_buffer)) is None:
             result.append(tag_bytes)
             if elements_since:
                 print("+", elements_since)
-            print(hex(skip_target_pos-4), tag_bytes)
+            print(hex(skip_target_pos - 4), tag_bytes)
             elements_since = 0
             if tag_bytes == b'\0\0\x01\0':
                 return result
@@ -710,7 +815,7 @@ def parse_jack_shit(input_buffer: BinaryIO) -> list[GameElement | bytes]:
 
 
 def parse_weird_constant_data(input_buffer: BinaryIO) -> AlmostConstantSection:
-    print(f"At {hex(input_buffer.tell())} ## NEW Weird constant data SECTION")
+    # print(f"At {hex(input_buffer.tell())} ## NEW Weird constant data SECTION")
     len_bytes = _parse_int32(input_buffer)
     bytes_ = input_buffer.read(len_bytes)
     len_tuples = _parse_int32(input_buffer)
@@ -720,13 +825,14 @@ def parse_weird_constant_data(input_buffer: BinaryIO) -> AlmostConstantSection:
 
 
 def parse_custom_data(input_buffer: BinaryIO) -> CustomDataSection:
-    print(f"At {hex(input_buffer.tell())} ## NEW CUSTOMDATA SECTION")
+    # print(f"At {hex(input_buffer.tell())} ## NEW CUSTOMDATA SECTION")
     len_label = _parse_int32(input_buffer)
     label = input_buffer.read(len_label)
-    print(label)
+    # print(label)
     count = _parse_int32(input_buffer)
-    print(f"Expected number of elements: {count}")
-    return CustomDataSection(label=label, elements=parse_n_elements(input_buffer, count))
+    # print(f"Expected number of elements: {count}")
+    return CustomDataSection(label=label,
+                             elements=parse_n_elements(input_buffer, count))
 
 
 def parse_civ6save(input_buffer: BinaryIO) -> list[FileSection]:
@@ -747,7 +853,7 @@ def parse_civ6save(input_buffer: BinaryIO) -> list[FileSection]:
     # Stage 3: 1x Nameless section
     result.append(parse_nameless_section(input_buffer))
 
-    # Stage 4: Compressed sectionn
+    # Stage 4: Compressed section
     result.append(parse_compressed(input_buffer))
 
     # Stage 5: Bitmap
@@ -766,7 +872,9 @@ def parse_civ6save(input_buffer: BinaryIO) -> list[FileSection]:
     input_buffer.seek(0, SEEK_END)
     file_end_at = input_buffer.tell()
     if after_parsing_at != file_end_at:
-        raise RuntimeError(f"Parsed all expected sections but finished before end of file (at {hex(after_parsing_at)} instead of {hex(file_end_at)})")
+        raise RuntimeError(
+            f"Parsed all expected sections but finished before end of file (at {hex(after_parsing_at)} instead of {hex(file_end_at)})"
+        )
 
     return result
 
@@ -785,10 +893,100 @@ def raw_byte_analysis(l: list[GameElement | bytes]) -> list[int | bytes]:
     return res
 
 
+_MAX_CHUNK_LEN_FROM_COMPRESSED = 255
+
+
+class _SectionInflator():
+
+    def __init__(self, section: CompressedSection):
+        self._deflated = b''.join(section.deflated_content)
+        self._inflator = zlib.decompressobj()
+        self._seq_pos = 0
+        self._deflated_len = len(self._deflated)
+
+    def get_chunk(self) -> bytes:
+        out = self._inflator.decompress(
+            self._inflator.unconsumed_tail,
+            max_length=_MAX_CHUNK_LEN_FROM_COMPRESSED)
+        while (len(out) < _MAX_CHUNK_LEN_FROM_COMPRESSED
+               and self._seq_pos < self._deflated_len):
+            out = out + self._inflator.decompress(
+                self._deflated[self._seq_pos:self._seq_pos +
+                               _MAX_CHUNK_LEN_FROM_COMPRESSED],
+                max_length=_MAX_CHUNK_LEN_FROM_COMPRESSED - len(out))
+            self._seq_pos = min(self._seq_pos + _MAX_CHUNK_LEN_FROM_COMPRESSED,
+                                self._deflated_len)
+        return out
+
+
+def _get_chunk_content(inflator: _SectionInflator) -> bytes:
+    chunk = inflator.get_chunk()
+    return len(chunk).to_bytes(1, signed=False) + chunk
+
+
+def package_compressed_sections(destination: BinaryIO,
+                                sections: list[CompressedSection]) -> None:
+    inflators = [_SectionInflator(section) for section in sections]
+
+    MB_count = 0
+    MB_count_2 = 0
+    there_is_more = True
+    while there_is_more:
+        MB_count += 1
+        if MB_count >= 1 << 12:
+            MB_count_2 += 1
+            MB_count = 0
+            print(f"Got {MB_count_2} MB per save")
+        content = [_get_chunk_content(i) for i in inflators]
+        destination.write(b''.join(content))
+        there_is_more = any(
+            len(chunk) == _MAX_CHUNK_LEN_FROM_COMPRESSED + 1
+            for chunk in content)
+
+
+def package_autosaves(destination: BinaryIO) -> None:
+    """Gets all AutoSave files and puts into one file."""
+    saves: list[list[FileSection]] = []
+    for i in range(1, 1502):
+        try:
+            with open(f'AutoSave_{i:04}.Civ6Save', 'rb') as savefile:
+                saves.append(parse_civ6save(savefile))
+        except FileNotFoundError:
+            break
+    print(f"Found {len(saves)} autosaves")
+
+    destination.write(len(saves).to_bytes(2, "little", signed=False))
+    if not saves:
+        return
+
+    num_sections_of_first = len(saves[0])
+    assert all(len(save) == num_sections_of_first for save in saves)
+
+    for j, section_of_first in enumerate(saves[0]):
+        print("!!!", j)
+        if isinstance(section_of_first, CompressedSection):
+            # with open("raw_content_of_last.bin", "wb") as out:
+            #     out.write(saves[-1][j].serialize_uncompressed())
+            print("!O!", hex(destination.tell()))
+            # package_compressed_sections(destination,
+            #                            [save[j] for save in saves])
+            # Override, hold only 1 save at a time uncompressed in memory
+            for save in saves:
+                destination.write(save[j].serialize_uncompressed())
+            # for debug purposes, flush the archive:
+            destination.flush()
+        else:
+            destination.write(
+                section_of_first.merge([save[j] for save in saves]))
+
+
 if __name__ == "__main__":
     # file_name = 'AutoSave_0108.Civ6Save'
     # file_name = 'PACHACUTI 1 4000 BC.Civ6Save'
+    """
     for i in range(1, 109):
         with open(f'AutoSave_{i:04}.Civ6Save', 'rb') as savefile:
             parse_civ6save(savefile)
-    
+    """
+    with bz2.open("./AutoSavePackage.bz2", "wb") as out:
+        package_autosaves(out)
