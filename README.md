@@ -69,7 +69,8 @@ The file seems to be divided into distinct sections. Some share the tag
 structure described in the next section, some have a different, unique
 structure.
 
-Here's the rundown of the sections I identified:
+Here's the rundown of the sections I identified, in the order they appear
+(there's no padding / gap / extra bytes between them):
 
 | No. | Section                         | Description                                                                                                                                                                                                                                                                                               |
 |:----|---------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
